@@ -77,10 +77,6 @@ def sanitize_filename(filename):
     
     return filename
 
-class DownloadCancelled(Exception):
-    """Raised when user cancels the download via the node UI."""
-    pass
-
 class DownloadManager:
     active_downloads = {}
     _lock = threading.Lock()
@@ -104,95 +100,85 @@ class DownloadManager:
             return False
 
     @staticmethod
-    def download_with_progress(url, save_path, filename=None, progress_callback=None, params=None, chunk_size=1024*1024, node_id=None, headers=None):
+    def download_with_progress(url, save_path, filename=None, progress_callback=None, params=None, chunk_size=1024*1024, node_id=None):
         """
-        Download with:
-        - Full ComfyUI progress bar
-        - Cancel support (deletes temp on cancel only)
-        - Resume support (keeps .tmp on network errors, resumes on next run)
-        - Headers support (for HF private/gated Bearer token)
+        Download a file with progress tracking and cancel support.
+        
+        Args:
+            url: Download URL
+            save_path: Directory to save file
+            filename: Optional filename (if not provided, extracted from response/URL)
+            progress_callback: Object with set_progress(percentage) method
+            params: Query parameters for the request
+            chunk_size: Download chunk size in bytes
+            node_id: Node ID for cancel tracking
         """
         cancel_event = threading.Event()
         node_id_str = str(node_id) if node_id is not None else None
-
+        
         if node_id_str:
             with DownloadManager._lock:
                 DownloadManager.active_downloads[node_id_str] = cancel_event
-
+                
+                print(f"===== DOWNLOAD START =====")
+                print(f"Registered cancel event for node_id: {node_id_str}")
+                print(f"Active downloads now: {list(DownloadManager.active_downloads.keys())}")
+        
         temp_path = None
         try:
-            # early filename handling for resume
-            resume_from = 0
-            early_filename = None
-            if filename is not None:
-                early_filename = sanitize_filename(filename)
-                potential_temp = os.path.join(save_path, early_filename + '.tmp')
-                if os.path.exists(potential_temp):
-                    resume_from = os.path.getsize(potential_temp)
-                    print(f"▶ Resuming from {resume_from:,} bytes for {early_filename}")
-
-            # build request headers (with Range for resume)
-            req_headers = dict(headers) if headers else {}
-            if resume_from > 0:
-                req_headers['Range'] = f'bytes={resume_from}-'
-
-            response = requests.get(url, stream=True, params=params, headers=req_headers)
+            response = requests.get(url, stream=True, params=params)
             response.raise_for_status()
-
-            # get final filename (if not provided)
-            if filename is None:
+            
+            total_size = int(response.headers.get('content-length', 0))
+            
+            # Get filename: use provided, then Content-Disposition, then URL
+            if not filename:
                 filename = DownloadManager._extract_filename(response, url)
+            
+            # Sanitize filename for OS compatibility
             filename = sanitize_filename(filename)
-
+            
             print(f"Downloading to: {os.path.join(save_path, filename)}")
-
+            
             full_path = os.path.join(save_path, filename)
             temp_path = full_path + '.tmp'
-
-            # determine total size (handles Range responses)
-            if 'content-range' in response.headers and resume_from > 0:
-                total_size = int(response.headers['content-range'].split('/')[-1])
-            else:
-                total_size = int(response.headers.get('content-length', 0))
-                if resume_from > 0:
-                    total_size += resume_from
-
-            downloaded = resume_from
-            open_mode = 'ab' if resume_from > 0 else 'wb'
-
-            with open(temp_path, open_mode) as file:
-                with tqdm(total=total_size, unit='iB', unit_scale=True, desc=filename, initial=downloaded) as pbar:
+            
+            downloaded = 0
+            with open(temp_path, 'wb') as file:
+                with tqdm(total=total_size, unit='iB', unit_scale=True, desc=filename) as pbar:
                     for data in response.iter_content(chunk_size=chunk_size):
+                        # Check cancel event
                         if node_id_str and cancel_event.is_set():
-                            raise DownloadCancelled("Download cancelled by user")
+                            print(f"===== DOWNLOAD CANCELLED =====")
+                            print(f"Node {node_id_str} download was cancelled")
+                            raise Exception("Download cancelled by user")
 
                         size = file.write(data)
                         downloaded += size
                         pbar.update(size)
                         pbar.refresh()
-
+                        
                         if progress_callback and total_size > 0:
                             progress = (downloaded / total_size) * 100.0
                             progress_callback.set_progress(progress)
-
+            
             shutil.move(temp_path, full_path)
-            print(f"✅ Download complete: {full_path}")
+            print(f"===== DOWNLOAD COMPLETE =====")
+            print(f"Successfully downloaded: {full_path}")
             return full_path
-
+            
         except Exception as e:
             if temp_path and os.path.exists(temp_path):
-                if isinstance(e, DownloadCancelled):
-                    os.remove(temp_path)
-                    print(f"🗑 Cleaned up temp file on cancel: {temp_path}")
-                else:
-                    print(f"⏸ Kept partial temp file for resume: {temp_path} (error: {e})")
-            print(f"❌ Download error: {str(e)}")
+                os.remove(temp_path)
+                print(f"Cleaned up temporary file: {temp_path}")
+            print(f"Error occurred during download: {str(e)}")
             raise
         finally:
             if node_id_str:
                 with DownloadManager._lock:
                     if node_id_str in DownloadManager.active_downloads:
                         del DownloadManager.active_downloads[node_id_str]
+                        print(f"Cleaned up cancel event for node: {node_id_str}")
 
     @staticmethod
     def _extract_filename(response, url):
