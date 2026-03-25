@@ -103,7 +103,7 @@ class DownloadManager:
             print(f"No active download found for: {node_id_str}")
             return False
 
-@staticmethod
+    @staticmethod
     def download_with_progress(url, save_path, filename=None, progress_callback=None, params=None, chunk_size=1024*1024, node_id=None, headers=None):
         """
         Download with:
